@@ -3,6 +3,7 @@
     - msr_init: net parameter initialization.
     - progress_bar: progress bar mimic xlua.progress.
 '''
+import math
 import random
 
 import numpy as np
@@ -58,3 +59,6 @@ def compute_weights_l1_norm(model):
     for param in model.parameters():
         norm_sum += torch.sum(torch.abs(param))
     return norm_sum
+
+
+

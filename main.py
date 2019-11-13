@@ -1,5 +1,7 @@
 # python main.py --lr=0.05 --lr_milestones 30 60 90 120 150 180 210 240 270 300 --lr_gamma=0.5 --wd=0.0005 --nesterov --momentum=0.9 --model="VGG('VGG11')" --epoch=300 --train_batch_size=128
 import os
+from math import sqrt
+
 import torch.optim as optim
 import torch.utils.data
 import torch.backends.cudnn as cudnn
@@ -8,13 +10,16 @@ import torchvision
 from torchvision import transforms as transforms
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-
+from cyclic_schedulers.cos_annealing_lr_scheduler import ReversedCosLRScheduler,CosLRScheduler
 import argparse
 
 from models import *
 from misc import progress_bar
 from learn_utils import reset_seed
+from utils.SampleAndIdxDataset import SampleIdxDataset
 
+from utils.train_cycle_strategies import *
+from utils.train_strategy import TrainStrategy
 
 CLASSES = ('plane', 'car', 'bird', 'cat', 'deer',
            'dog', 'frog', 'horse', 'ship', 'truck')
@@ -24,6 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description="cifar-10 with PyTorch")
     parser.add_argument('--model', default="VGG('VGG19')",
                         type=str, help='what model to use')
+
     parser.add_argument('--half', '-hf', action='store_true',
                         help='use half precision')
     parser.add_argument('--load_model', default="",
@@ -52,18 +58,6 @@ def main():
                         type=int, help='perform_top_down_sum')
     parser.add_argument('--save_dir', default="checkpoints",
                         type=str, help='save dir name')
-
-    parser.add_argument('--lr_milestones', nargs='+', type=int,
-                        default=[30, 60, 90, 120, 150], help='Lr Milestones')
-    parser.add_argument('--use_reduce_lr', action='store_true',
-                        help='Use reduce lr on plateou')
-    parser.add_argument('--reduce_lr_patience', type=int,
-                        default=20, help='reduce lr patience')
-    parser.add_argument('--reduce_lr_delta', type=float,
-                        default=0.02, help='minimal difference to improve losss')
-    parser.add_argument('--reduce_lr_min_lr', type=float,
-                        default=0.0005, help='minimal lr')
-    parser.add_argument('--lr_gamma', default=0.5, type=float, help='Lr gamma')
 
     parser.add_argument('--num_workers_train', default=4,
                         type=int, help='number of workers for loading train data')
@@ -103,11 +97,11 @@ class Solver(object):
         train_transform = transforms.Compose(
             [transforms.RandomHorizontalFlip(), transforms.ToTensor()])
         test_transform = transforms.Compose([transforms.ToTensor()])
-        train_set = torchvision.datasets.CIFAR10(
-            root='../storage', train=True, download=True, transform=train_transform)
+        train_set = SampleIdxDataset(torchvision.datasets.CIFAR100(
+            root='../storage', train=True, download=True, transform=train_transform))
         self.train_loader = torch.utils.data.DataLoader(
             dataset=train_set, batch_size=self.args.train_batch_size, shuffle=True)
-        test_set = torchvision.datasets.CIFAR10(
+        test_set = torchvision.datasets.CIFAR100(
             root='../storage', train=False, download=True, transform=test_transform)
         self.test_loader = torch.utils.data.DataLoader(
             dataset=test_set, batch_size=self.args.test_batch_size, shuffle=False)
@@ -120,6 +114,10 @@ class Solver(object):
             self.device = torch.device('cpu')
 
         self.model = eval(self.args.model)
+        # self.embed_transform = EmbedUpsample(4)
+        self.embed_transform = NoUpsample()
+        self.model = SampleEmbeddingNet(self.model, embeddings_count=50000, embed_dim=3*32*32, embed_transform=self.embed_transform,embed_factor=1.0,embed_max_norm=None)
+
         self.save_dir = "../storage/" + self.args.save_dir
         if not os.path.isdir(self.save_dir):
             os.mkdir(self.save_dir)
@@ -171,14 +169,16 @@ class Solver(object):
             self.model.load_state_dict(torch.load(self.args.load_model))
         self.model = self.model.to(self.device)
 
-        self.optimizer = optim.SGD(self.model.parameters(
-        ), lr=self.args.lr, momentum=self.args.momentum, weight_decay=self.args.wd, nesterov=self.args.nesterov)
-        if self.args.use_reduce_lr:
-            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='min', factor=self.args.lr_gamma, patience=self.args.reduce_lr_patience, min_lr=self.args.reduce_lr_min_lr, verbose=True, threshold=self.args.reduce_lr_delta)
-        else:
-            self.scheduler = optim.lr_scheduler.MultiStepLR(
-                self.optimizer, milestones=self.args.lr_milestones, gamma=self.args.lr_gamma)
+        # self.optimizer = optim.SGD(self.model.parameters(
+        # ), lr=self.args.lr, momentum=self.args.momentum, weight_decay=self.args.wd, nesterov=self.args.nesterov)
+        self.optimizer  =optim.SGD([
+            {'params': self.model.main_net.parameters()},
+            {'params': self.model.embed.parameters()},
+        ], lr=self.args.lr, momentum=self.args.momentum, weight_decay = self.args.wd)
+
+        # self.optimizer = optim.SGD(self.model.embed.parameters(), lr=self.args.lr, momentum=self.args.momentum, weight_decay=self.args.wd, nesterov=self.args.nesterov)
+
+
         self.criterion = nn.CrossEntropyLoss().to(self.device)
 
     def get_batch_plot_idx(self):
@@ -190,19 +190,16 @@ class Solver(object):
         self.model.train()
         total_loss = 0
         correct = 0
-        TP = 0
-        TN = 0
-        FP = 0
-        FN = 0
         total = 0
 
-        for batch_num, (data, target) in enumerate(self.train_loader):
-            data, target = data.to(self.device), target.to(self.device)
+        for batch_num, (data, target, idxs) in enumerate(self.train_loader):
+            data, target,idxs = data.to(self.device), target.to(self.device), idxs.to(self.device)
             if self.device == torch.device('cuda') and self.args.half:
                 data = data.half()
             self.optimizer.zero_grad()
 
-            output = self.model(data)
+            output = self.model(data, idxs, self.embed_pen)
+            # embed_weights = self.model.embed.weight.norm()
             loss = self.criterion(output, target)
             loss.backward()
             self.optimizer.step()
@@ -216,46 +213,26 @@ class Solver(object):
             correct += np.sum(prediction[1].cpu().numpy()
                               == target.cpu().numpy())
 
-            pred_labels = torch.nn.functional.one_hot(
-                prediction[1], num_classes=10).cpu().numpy()
-            true_labels = torch.nn.functional.one_hot(
-                target, num_classes=10).cpu().numpy()
-
-            # True Positive (TP): we predict a label of 1 (positive), and the true label
-            TP += np.sum(np.logical_and(pred_labels == 1, true_labels == 1))
-
-            # True Negative (TN): we predict a label of 0 (negative), and the true label is 0.
-            TN += np.sum(np.logical_and(pred_labels == 0, true_labels == 0))
-
-            # False Positive (FP): we predict a label of 1 (positive), but the true label is 0.
-            FP += np.sum(np.logical_and(pred_labels == 1, true_labels == 0))
-
-            # False Negative (FN): we predict a label of 0 (negative), but the true label is 1.
-            FN += np.sum(np.logical_and(pred_labels == 0, true_labels == 1))
-
             if self.args.progress_bar:
                 progress_bar(batch_num, len(self.train_loader), 'Loss: %.4f | Acc: %.3f%% (%d/%d)'
                              % (total_loss / (batch_num + 1), 100.0 * correct/total, correct, total))
 
-        return total_loss, correct / total, TP, TN, FP, FN
+        return total_loss, correct / total
 
     def test(self):
         print("test:")
         self.model.eval()
         total_loss = 0
         correct = 0
-        TP = 0
-        TN = 0
-        FP = 0
-        FN = 0
         total = 0
 
         with torch.no_grad():
-            for batch_num, (data, target) in enumerate(self.test_loader):
-                data, target = data.to(self.device), target.to(self.device)
+            for batch_num, (data, target, idxs) in enumerate(self.test_loader):
+                data, target, idxs = data.to(self.device), target.to(self.device), idxs.to(self.device)
                 if self.device == torch.device('cuda') and self.args.half:
                     data = data.half()
-                output = self.model(data)
+                idxs = idxs + 1000000
+                output = self.model(data, idxs)
                 loss = self.criterion(output, target)
                 self.writer.add_scalar(
                     "Test/Batch Loss", loss.item(), self.get_batch_plot_idx())
@@ -266,32 +243,11 @@ class Solver(object):
                 correct += np.sum(prediction[1].cpu().numpy()
                                   == target.cpu().numpy())
 
-                pred_labels = torch.nn.functional.one_hot(
-                    prediction[1], num_classes=10).cpu().numpy()
-                true_labels = torch.nn.functional.one_hot(
-                    target, num_classes=10).cpu().numpy()
-
-                # True Positive (TP): we predict a label of 1 (positive), and the true label
-                TP += np.sum(np.logical_and(pred_labels ==
-                                            1, true_labels == 1))
-
-                # True Negative (TN): we predict a label of 0 (negative), and the true label is 0.
-                TN += np.sum(np.logical_and(pred_labels ==
-                                            0, true_labels == 0))
-
-                # False Positive (FP): we predict a label of 1 (positive), but the true label is 0.
-                FP += np.sum(np.logical_and(pred_labels ==
-                                            1, true_labels == 0))
-
-                # False Negative (FN): we predict a label of 0 (negative), but the true label is 1.
-                FN += np.sum(np.logical_and(pred_labels ==
-                                            0, true_labels == 1))
-
                 if self.args.progress_bar:
                     progress_bar(batch_num, len(self.test_loader), 'Loss: %.4f | Acc: %.3f%% (%d/%d)'
                                  % (total_loss / (batch_num + 1), 100. * correct / total, correct, total))
 
-        return total_loss, correct/total, TP, TN, FP, FN
+        return total_loss, correct/total
 
     def save(self, epoch, accuracy, tag=None):
         if tag != None:
@@ -305,118 +261,86 @@ class Solver(object):
         print("Checkpoint saved to {}".format(model_out_path))
 
     def run(self):
+
+        ONLY_EMBEDS_EC = 5
+        FULL_EC = 10
+        ONLY_MAIN_NET_EC = 10
+        MIN_LR_VAL = self.args.lr
+        CYCLE_MUL = 1
+
         reset_seed(self.args.seed)
         self.load_data()
         self.load_model()
 
-        accuracy = 0
-        for epoch in range(1, self.args.epoch + 1):
-            print("\n===> epoch: %d/%d" % (epoch, self.args.epoch))
 
-            train_result = self.train()
 
-            # Took the metrics from here: https://en.wikipedia.org/wiki/Precision_and_recall
-            loss = train_result[0]
-            accuracy = train_result[1]
-            TP = train_result[2]
-            TN = train_result[3]
-            FP = train_result[4]
-            FN = train_result[5]
-            TPR = TP/(TP+FN)
-            TNR = TN/(TN+FP)
-            PPV = TP/(TP+FP)
-            NPV = TN/(TN+FN)
-            FNR = FN/(FN+TP)
-            FPR = FP/(FP+TN)
-            FDR = FP/(FP+TP)
-            FOR = FN/(FN+TN)
-            TS = TP/(TP+FN+FP)
-            F1 = (2*TP)/(2*TP+FP+FN)
-            MCC = (TP*TN - FP*FN)/np.sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
-            BM = TPR+TNR-1
-            MK = PPV+NPV-1
+        plot_idx_mng = PlotIdxsMng()
+        only_embeds_cos_scheduler = CosineAnnealingWarmRestarts(self.optimizer, ONLY_EMBEDS_EC, CYCLE_MUL, MIN_LR_VAL)
+        full_model_cos_scheduler = CosineAnnealingWarmRestarts(self.optimizer, FULL_EC, CYCLE_MUL, MIN_LR_VAL)
+        only_main_net_cos_scheduler = CosineAnnealingWarmRestarts(self.optimizer, ONLY_MAIN_NET_EC, CYCLE_MUL, MIN_LR_VAL)
 
-            self.writer.add_scalar("Train/Loss", loss, epoch)
-            self.writer.add_scalar("Train/Accuracy", accuracy, epoch)
-            self.writer.add_scalar("Train/F1 score", F1, epoch)
-            self.writer.add_scalar("Train/Sensitivity", TPR, epoch)
-            self.writer.add_scalar("Train/Specificity", TNR, epoch)
-            self.writer.add_scalar("Train/Precision", PPV, epoch)
-            self.writer.add_scalar(
-                "Train/Negative predictive value", NPV, epoch)
-            self.writer.add_scalar("Train/Miss rate", FNR, epoch)
-            self.writer.add_scalar("Train/Fall-out", FPR, epoch)
-            self.writer.add_scalar("Train/False discovery rate ", FDR, epoch)
-            self.writer.add_scalar("Train/False omission rate ", FOR, epoch)
-            self.writer.add_scalar("Train/Threat score", TS, epoch)
-            self.writer.add_scalar("Train/TP", TP, epoch)
-            self.writer.add_scalar("Train/TN", TN, epoch)
-            self.writer.add_scalar("Train/FP", FP, epoch)
-            self.writer.add_scalar("Train/FN", FN, epoch)
-            self.writer.add_scalar(
-                "Train/Matthews correlation coefficient", MCC, epoch)
-            self.writer.add_scalar("Train/Informedness", BM, epoch)
-            self.writer.add_scalar("Train/Markedness", MK, epoch)
+        # only_embeds_cycle = TrainOnlyEmbeds(self.model, self.optimizer, self.criterion, ONLY_EMBEDS_EC, self.train_loader, self.test_loader, self.writer, self.device, plot_idx_mng,only_embeds_cos_scheduler)
+        full_model_cycle = TrainFullModelZeroOutEmbeds(self.model, self.optimizer, self.criterion, FULL_EC, self.train_loader, self.test_loader, self.writer, self.device, plot_idx_mng, full_model_cos_scheduler)
+        only_main_net_cycle = TrainOnlyMainNetZeroOutEmbedsFactor(self.model, self.optimizer, self.criterion, ONLY_MAIN_NET_EC, self.train_loader, self.test_loader, self.writer, self.device, plot_idx_mng,only_main_net_cos_scheduler)
 
-            test_result = self.test()
+        # ts = TrainStrategy(15, [only_embeds_cycle, full_model_cycle, only_main_net_cycle])
+        # ts = TrainStrategy(15, [full_model_cycle, only_main_net_cycle])
+        ts = TrainStrategy(15, [full_model_cycle])
+        ts.run()
 
-            loss = test_result[0]
-            accuracy = test_result[1]
-            TP = test_result[2]
-            TN = test_result[3]
-            FP = test_result[4]
-            FN = test_result[5]
-            TPR = TP/(TP+FN)
-            TNR = TN/(TN+FP)
-            PPV = TP/(TP+FP)
-            NPV = TN/(TN+FN)
-            FNR = FN/(FN+TP)
-            FPR = FP/(FP+TN)
-            FDR = FP/(FP+TP)
-            FOR = FN/(FN+TN)
-            TS = TP/(TP+FN+FP)
-            F1 = (2*TP)/(2*TP+FP+FN)
-            MCC = (TP*TN - FP*FN)/np.sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
-            BM = TPR+TNR-1
-            MK = PPV+NPV-1
 
-            self.writer.add_scalar("Test/Loss", loss, epoch)
-            self.writer.add_scalar("Test/Accuracy", accuracy, epoch)
-            self.writer.add_scalar("Test/F1 score", F1, epoch)
-            self.writer.add_scalar("Test/Sensitivity", TPR, epoch)
-            self.writer.add_scalar("Test/Specificity", TNR, epoch)
-            self.writer.add_scalar("Test/Precision", PPV, epoch)
-            self.writer.add_scalar(
-                "Test/Negative predictive value", NPV, epoch)
-            self.writer.add_scalar("Test/Miss rate", FNR, epoch)
-            self.writer.add_scalar("Test/Fall-out", FPR, epoch)
-            self.writer.add_scalar("Test/False discovery rate ", FDR, epoch)
-            self.writer.add_scalar("Test/False omission rate ", FOR, epoch)
-            self.writer.add_scalar("Test/Threat score", TS, epoch)
-            self.writer.add_scalar("Test/TP", TP, epoch)
-            self.writer.add_scalar("Test/TN", TN, epoch)
-            self.writer.add_scalar("Test/FP", FP, epoch)
-            self.writer.add_scalar("Test/FN", FN, epoch)
-            self.writer.add_scalar(
-                "Test/Matthews correlation coefficient", MCC, epoch)
-            self.writer.add_scalar("Test/Informedness", BM, epoch)
-            self.writer.add_scalar("Test/Markedness", MK, epoch)
 
-            self.writer.add_scalar("Model/Norm", self.get_model_norm(), epoch)
-            self.writer.add_scalar(
-                "Train Params/Learning rate", self.scheduler.get_lr()[0], epoch)
-
-            if accuracy < test_result[1]:
-                accuracy = test_result[1]
-                self.save(epoch, accuracy)
-
-            if self.args.save_model and epoch % self.args.save_interval == 0:
-                self.save(0, epoch)
-
-            if self.args.use_reduce_lr:
-                self.scheduler.step(train_result[0])
-            else:
-                self.scheduler.step(epoch)
+        # accuracy = 0
+        # for epoch in range(1, self.args.epoch + 1):
+        #     if epoch % 5 == 0:
+        #         self.args.wd = max(0.0005, 0.7 * self.args.wd)
+        #         self.embed_pen = max(0.0, self.embed_pen + self.args.embed_pen_inc)
+        #         self.optimizer = optim.SGD([
+        #             {'params': self.model.features.parameters()},
+        #             {'params': self.model.classifier.parameters()},
+        #             {'params': self.model.embed.parameters(), 'weight_decay': 0.0},
+        #         ], lr=self.args.lr, momentum=self.args.momentum, weight_decay=self.args.wd)
+        #
+        #     print("\n===> epoch: %d/%d" % (epoch, self.args.epoch))
+        #
+        #     train_result = self.train()
+        #     # if epoch == self.args.embed_decay_miletones[0]:
+        #         # self.embed_pen += self.args.embed_pen_inc
+        #         # print("INCREASING EMBEDDING PEN TO ",self.embed_pen)
+        #         # self.args.embed_decay_miletones = self.args.embed_decay_miletones[1:]
+        #     loss = train_result[0]
+        #     accuracy = train_result[1]
+        #
+        #     self.writer.add_scalar("Train/Loss", loss, epoch)
+        #     self.writer.add_scalar("Train/Accuracy", accuracy, epoch)
+        #
+        #     test_result = self.test()
+        #
+        #     loss = test_result[0]
+        #     accuracy = test_result[1]
+        #
+        #     self.writer.add_scalar("Test/Loss", loss, epoch)
+        #     self.writer.add_scalar("Test/Accuracy", accuracy, epoch)
+        #
+        #     self.writer.add_scalar("Model/Norm", self.get_model_norm(), epoch)
+        #     self.writer.add_scalar(
+        #         "Train Params/Learning rate", self.scheduler.get_lr()[0], epoch)
+        #
+        #     self.writer.add_scalar("Model/EmbedWeightsNorm", self.model.get_norm_of_weights_connected_to_embeds(), epoch)
+        #     self.writer.add_scalar("Model/EmbedWeightsPen", self.embed_pen, epoch)
+        #     self.writer.add_scalar("Model/EmbedNorm", self.model.embed.weight.norm(), epoch)
+        #     #
+        #     if accuracy < test_result[1]:
+        #         accuracy = test_result[1]
+        #         self.save(epoch, accuracy)
+        #
+        #     if self.args.save_model and epoch % self.args.save_interval == 0:
+        #         self.save(0, epoch)
+        #
+        #     if self.args.use_reduce_lr:
+        #         self.scheduler.step(train_result[0])
+        #     else:
+        #         self.scheduler.step(epoch)
 
     def get_model_norm(self, norm_type=2):
         norm = 0.0

@@ -57,7 +57,8 @@ class WideResNet(nn.Module):
         n = int((depth - 4) / 6)
         block = BasicBlock
         # 1st conv before any network block
-        self.conv1 = nn.Conv2d(3, n_channels[0], kernel_size=3, stride=1,
+        self.embed = nn.Embedding(num_embeddings=60000, embedding_dim=32 * 32)
+        self.conv1 = nn.Conv2d(3 + 1, n_channels[0], kernel_size=3, stride=1,
                                padding=1, bias=False)
         # 1st block
         self.block1 = NetworkBlock(n, n_channels[0], n_channels[1], block, 1, drop_rate)
@@ -81,7 +82,11 @@ class WideResNet(nn.Module):
             elif isinstance(m, nn.Linear):
                 m.bias.data.zero_()
 
-    def forward(self, x):
+    def forward(self, x, idxs):
+        if not self.training:
+            idxs = idxs + 50000
+        embeds = self.embed(idxs).view(x.size(0), 1, x.size(-2), x.size(-1))
+        x = torch.cat([x, embeds], dim=1)
         out = self.conv1(x)
         out = self.block1(out)
         out = self.block2(out)
